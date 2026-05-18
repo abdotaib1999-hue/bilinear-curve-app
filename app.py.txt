@@ -208,3 +208,4 @@ try:
 
 except Exception as e:
     st.error(f"Une erreur est survenue lors des calculs. Vérifiez vos données. Détail de l'erreur : {e}")
+        
