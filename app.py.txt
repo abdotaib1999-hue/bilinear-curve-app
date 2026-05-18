@@ -1,0 +1,210 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.integrate import trapezoid
+from scipy.signal import savgol_filter
+from scipy.interpolate import interp1d
+from scipy.optimize import root_scalar
+import io
+
+# ==============================================================================
+# CONFIGURATION DE LA PAGE STREAMLIT
+# ==============================================================================
+st.set_page_config(page_title="Bilinéarisation Pushover", page_icon="📈", layout="wide")
+
+st.title("📈 Bilinéarisation de Courbe de Capacité (Pushover)")
+st.markdown("""
+Cette application transforme une courbe de capacité réelle en modèles bilinéaires idéalisés selon l'**Eurocode 8 (Annexe B)** et l'**ASCE 41**, basés sur le principe de conservation d'énergie.
+""")
+
+# ==============================================================================
+# 1. FONCTIONS DE TRAITEMENT SCIENTIFIQUES
+# ==============================================================================
+@st.cache_data
+def lissage_donnees(d, f):
+    f_lisse = savgol_filter(f, window_length=15, polyorder=3)
+    f_lisse[0] = 0.0 
+    return f_lisse
+
+@st.cache_data
+def bilinearisation_eurocode8(d, f_lisse):
+    idx_m = np.argmax(f_lisse)
+    dm = d[idx_m]
+    Vm = f_lisse[idx_m]
+    
+    Em = trapezoid(f_lisse[:idx_m+1], d[:idx_m+1])
+    Vy = Vm
+    dy = 2 * (dm - (Em / Vy))
+    Ke = Vy / dy
+    
+    d_bilin = np.array([0, dy, dm])
+    f_bilin = np.array([0, Vy, Vy])
+    
+    return Ke, Vy, dy, d_bilin, f_bilin, Em
+
+@st.cache_data
+def bilinearisation_asce41(d, f_lisse):
+    idx_m = np.argmax(f_lisse)
+    dm = d[idx_m]
+    Vm = f_lisse[idx_m]
+    Em = trapezoid(f_lisse[:idx_m+1], d[:idx_m+1])
+    
+    d_asc = d[:idx_m+1]
+    f_asc = np.maximum.accumulate(f_lisse[:idx_m+1]) + np.linspace(0, 1e-5, idx_m+1)
+    inv_interp = interp1d(f_asc, d_asc, kind='linear', fill_value="extrapolate")
+    
+    def erreur_energie(Vy_test):
+        V_06 = 0.6 * Vy_test
+        d_06 = inv_interp(V_06)
+        Ke = V_06 / d_06
+        dy = Vy_test / Ke
+        area_bilin = 0.5 * Vy_test * dy + 0.5 * (Vy_test + Vm) * (dm - dy)
+        return area_bilin - Em
+
+    res = root_scalar(erreur_energie, bracket=[0.5 * Vm, 1.5 * Vm], method='brentq')
+    Vy = res.root
+    
+    V_06 = 0.6 * Vy
+    d_06 = float(inv_interp(V_06))
+    Ke = V_06 / d_06
+    dy = Vy / Ke
+    Kp = (Vm - Vy) / (dm - dy)
+    Alpha = Kp / Ke
+    
+    d_bilin = np.array([0, dy, dm])
+    f_bilin = np.array([0, Vy, Vm])
+    
+    return Ke, Vy, dy, Alpha, d_bilin, f_bilin, Em, d_06, V_06
+
+def generer_excel(Ke_ec8, Vy_ec8, dy_ec8, d_ec8, f_ec8, Ke_asce, Vy_asce, dy_asce, alpha_asce, d_asce, f_asce):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_params = pd.DataFrame({
+            'Paramètre': ['Rigidité Initiale Ke', 'Force de Plastification Vy', 'Déplacement de Plastification dy', 'Pente Post-Élastique (Alpha)'],
+            'Eurocode 8': [Ke_ec8, Vy_ec8, dy_ec8, 0.0],
+            'ASCE 41': [Ke_asce, Vy_asce, dy_asce, alpha_asce]
+        })
+        df_params.to_excel(writer, sheet_name='Parametres', index=False)
+        
+        df_courbes = pd.DataFrame({
+            'Point': ['Origine', 'Plastification', 'Cible/Ultime'],
+            'd_EC8': d_ec8, 'f_EC8': f_ec8,
+            'd_ASCE41': d_asce, 'f_ASCE41': f_asce
+        })
+        df_courbes.to_excel(writer, sheet_name='Coordonnees', index=False)
+    processed_data = output.getvalue()
+    return processed_data
+
+# ==============================================================================
+# 2. INTERFACE UTILISATEUR & UPLOAD DE FICHIER
+# ==============================================================================
+st.sidebar.header("📥 Importation des données")
+uploaded_file = st.sidebar.file_uploader("Chargez votre fichier (Excel ou CSV)", type=['xlsx', 'csv'])
+
+if uploaded_file is not None:
+    if uploaded_file.name.endswith('csv'):
+        df_data = pd.read_csv(uploaded_file)
+    else:
+        df_data = pd.read_excel(uploaded_file)
+else:
+    st.sidebar.info("Aucun fichier chargé. Utilisation de données simulées pour la démonstration.")
+    d_sim = np.linspace(0, 100, 300)
+    f_sim = 2000 * (1 - np.exp(-0.06 * d_sim)) - 2.5 * d_sim
+    df_data = pd.DataFrame({'Déplacement (mm)': d_sim, 'Force (kN)': f_sim})
+
+st.sidebar.subheader("Sélection des colonnes")
+col_options = df_data.columns.tolist()
+col_d = st.sidebar.selectbox("Colonne Déplacement (X)", options=col_options, index=0)
+col_f = st.sidebar.selectbox("Colonne Force (Y)", options=col_options, index=1 if len(col_options)>1 else 0)
+
+d_brut = df_data[col_d].values
+f_brut = df_data[col_f].values
+
+# ==============================================================================
+# 3. EXÉCUTION DES CALCULS
+# ==============================================================================
+try:
+    f_lisse = lissage_donnees(d_brut, f_brut)
+
+    # Calculs EC8 et ASCE 41
+    Ke_ec8, Vy_ec8, dy_ec8, d_ec8, f_ec8, Em_real = bilinearisation_eurocode8(d_brut, f_lisse)
+    Ke_asce, Vy_asce, dy_asce, alpha_asce, d_asce, f_asce, Em_asce, d06, v06 = bilinearisation_asce41(d_brut, f_lisse)
+    Em_ec8 = trapezoid(f_ec8, d_ec8)
+
+    # ==============================================================================
+    # 4. AFFICHAGE DES RÉSULTATS DANS STREAMLIT
+    # ==============================================================================
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🔵 Résultats Eurocode 8")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Ke (Rigidité)", f"{Ke_ec8:.2f}")
+        m2.metric("Vy (Plastification)", f"{Vy_ec8:.2f}")
+        m3.metric("dy (Déplacement)", f"{dy_ec8:.2f}")
+
+    with col2:
+        st.subheader("🔴 Résultats ASCE 41")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ke (Rigidité)", f"{Ke_asce:.2f}")
+        m2.metric("Vy (Plastification)", f"{Vy_asce:.2f}")
+        m3.metric("dy (Déplacement)", f"{dy_asce:.2f}")
+        m4.metric("Alpha (α)", f"{alpha_asce:.4f}")
+
+    st.divider()
+
+    # Génération du graphique
+    st.subheader("📊 Graphiques Comparatifs")
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    idx_m = np.argmax(f_lisse)
+
+    # FIG 1 : EC8
+    axs[0, 0].plot(d_brut[:idx_m+1], f_lisse[:idx_m+1], 'k-', lw=2, label="Courbe lissée")
+    axs[0, 0].plot(d_ec8, f_ec8, 'b-o', lw=3, label="Idéalisation EC8")
+    axs[0, 0].fill_between(d_brut[:idx_m+1], 0, f_lisse[:idx_m+1], color='gray', alpha=0.2, label='Énergie réelle')
+    axs[0, 0].fill_between(d_ec8, 0, f_ec8, color='blue', alpha=0.1, label='Énergie EC8')
+    axs[0, 0].set_title("1. Bilinéarisation Eurocode 8")
+    axs[0, 0].set_xlabel("Déplacement"), axs[0, 0].set_ylabel("Force")
+    axs[0, 0].legend()
+
+    # FIG 2 : ASCE 41
+    axs[0, 1].plot(d_brut[:idx_m+1], f_lisse[:idx_m+1], 'k-', lw=2, label="Courbe lissée")
+    axs[0, 1].plot(d_asce, f_asce, 'r-o', lw=3, label=f"Idéalisation ASCE 41")
+    axs[0, 1].scatter([d06], [v06], color='red', s=100, zorder=5, label="Point à 60% de Vy")
+    axs[0, 1].set_title("2. Bilinéarisation ASCE 41")
+    axs[0, 1].set_xlabel("Déplacement"), axs[0, 1].set_ylabel("Force")
+    axs[0, 1].legend()
+
+    # FIG 3 : ENERGIES
+    bars = axs[1, 0].bar(['Énergie Réelle', 'Aire EC8', 'Aire ASCE 41'], [Em_real, Em_ec8, Em_asce], color=['gray', 'blue', 'red'])
+    axs[1, 0].set_title("3. Validation de la conservation d'Énergie")
+    for bar in bars:
+        yval = bar.get_height()
+        axs[1, 0].text(bar.get_x() + bar.get_width()/2, yval, f"{yval:.1f}", ha='center', va='bottom')
+
+    # FIG 4 : ZOOM
+    axs[1, 1].plot(d_brut[:int(idx_m*0.3)], f_lisse[:int(idx_m*0.3)], 'k-', lw=2, label="Réel")
+    axs[1, 1].plot(d_ec8[:2], f_ec8[:2], 'b--', lw=2, label=f"Ke EC8 = {Ke_ec8:.1f}")
+    axs[1, 1].plot([0, dy_asce], [0, Vy_asce], 'r--', lw=2, label=f"Ke ASCE = {Ke_asce:.1f}")
+    axs[1, 1].set_title("4. Zoom : Comparaison des Rigidités Initiales")
+    axs[1, 1].legend()
+
+    plt.tight_layout()
+    st.pyplot(fig) # Affichage Streamlit
+
+    # Export Excel
+    st.divider()
+    st.subheader("💾 Exporter les coordonnées")
+    excel_data = generer_excel(Ke_ec8, Vy_ec8, dy_ec8, d_ec8, f_ec8, Ke_asce, Vy_asce, dy_asce, alpha_asce, d_asce, f_asce)
+    
+    st.download_button(
+        label="📥 Télécharger le rapport Excel (Paramètres & Coordonnées)",
+        data=excel_data,
+        file_name='Resultats_Bilinearisation.xlsx',
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+except Exception as e:
+    st.error(f"Une erreur est survenue lors des calculs. Vérifiez vos données. Détail de l'erreur : {e}")
